@@ -1,0 +1,9 @@
+pymavlink
+customtkinter
+tkintermapview
+packaging
+requests
+pillow
+ultralytics
+opencv-python
+
