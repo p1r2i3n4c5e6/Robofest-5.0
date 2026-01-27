@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.venv/
+runs/
+*.zip
+rpi_deploy/venv/
