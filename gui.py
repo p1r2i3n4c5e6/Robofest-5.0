@@ -322,8 +322,15 @@ class DroneApp(tk.Tk):
         idx = len(self.backends) + 1
         print(f"Adding New Drone: ID {idx} (D{idx-1})")
         
-        # Backend & Logic
-        self.backends[idx] = DroneBackend(drone_id=idx)
+        # Backend & Logic — each drone gets a unique default connection string
+        if idx == 1:
+            default_conn = '/dev/ttyUSB0'
+        elif idx == 2:
+            default_conn = '/dev/ttyACM1'
+        else:
+            default_conn = f'/dev/ttyUSB{idx-1}'
+        
+        self.backends[idx] = DroneBackend(drone_id=idx, connect_str=default_conn)
         self.mission_mgrs[idx] = MissionManager(self.backends[idx])
         self.ai_pilots[idx] = AIPilot(self.backends[idx], self.mission_mgrs[idx], self.update_video_feed, self.add_geotag_marker)
         
@@ -778,6 +785,17 @@ class DroneApp(tk.Tk):
 
     def select_drone(self, idx):
         if idx not in self.backends: return
+        
+        # SAVE the current drone's connection string before switching
+        if self.active_drone_idx is not None and self.active_drone_idx in self.backends:
+            old_backend = self.backends[self.active_drone_idx]
+            # Only save if the entry is enabled (not connected/locked)
+            if not old_backend.connected:
+                try:
+                    old_backend.connect_str = self.detail_conn_entry.get()
+                except:
+                    pass
+        
         self.active_drone_idx = idx
         
         # Visual Update on Fleet List
@@ -798,8 +816,6 @@ class DroneApp(tk.Tk):
         self.lbl_detail_header.config(text=f"DRONE {idx-1} (D{idx-1})", fg=color)
         
         # Update Connection Entry Text
-        # Assuming we store connection strings in backend or separate dict?
-        # For now, default based on ID
         default_port = f"/dev/ttyUSB{idx-1}"
         if idx == 1: default_port = "/dev/ttyUSB0"
         elif idx == 2: default_port = "/dev/ttyACM1"
@@ -918,12 +934,15 @@ class DroneApp(tk.Tk):
              return
         
         # Connection
-        if backend.connected:
-            self.detail_conn_btn.config(text="DISCONNECT", state="normal", style="Connect.TButton")
-            self.detail_conn_entry.config(state="disabled")
-        else:
-            self.detail_conn_btn.config(text="CONNECT", state="normal")
-            self.detail_conn_entry.config(state="normal")
+        try:
+            if backend.connected:
+                self.detail_conn_btn.config(text="DISCONNECT", state="normal", style="Connect.TButton")
+                self.detail_conn_entry.config(state="disabled")
+            else:
+                self.detail_conn_btn.config(text="CONNECT", state="normal")
+                self.detail_conn_entry.config(state="normal")
+        except Exception:
+            pass  # Prevent segfault from tkintermapview thread race
             
         # Status
         mode = s['mode']
@@ -1349,7 +1368,11 @@ class DroneApp(tk.Tk):
         self.btn_upload = ttk.Button(self.overlay_frame, text="Upload Mission 📤", command=self.upload_mission, style="HUD.TButton")
         self.btn_upload.pack(pady=5, padx=5, fill="x")
         
-        self.btn_start = ttk.Button(self.overlay_frame, text="START GUIDED ▶", command=self.start_mission, state="disabled", style="HUDSuccess.TButton")
+        # ARM ALL DRONES Button (Swarm)
+        self.btn_arm_all = ttk.Button(self.overlay_frame, text="🛡️ ARM ALL DRONES", command=self.arm_all_drones, style="HUDWarn.TButton")
+        self.btn_arm_all.pack(pady=5, padx=5, fill="x")
+        
+        self.btn_start = ttk.Button(self.overlay_frame, text="🚁 START ALL GUIDED", command=self.start_mission, style="HUDSuccess.TButton")
         self.btn_start.pack(pady=5, padx=5, fill="x")
         
         # BREAK / CONTINUE CONTROLS
@@ -1618,39 +1641,58 @@ class DroneApp(tk.Tk):
         
     def do_takeoff(self):
         try:
-            alt = float(self.entry_alt.get())
+            alt = float(self.detail_alt_entry.get())
         except ValueError:
             alt = 5.0 # Fallback
             
-        print(f"Executing Takeoff to {alt}m (Autonomous/Guided)")
+        backend = self.backends[self.active_drone_idx]
+        print(f"Executing Takeoff to {alt}m (Autonomous/Guided) for {backend.log_prefix}")
         
         # 1. Enforce GUIDED Mode (Autonomous Takeoff Requirement)
-        if self.backend.state['mode'] != "GUIDED":
-             self.backend.set_mode("GUIDED")
+        if backend.state['mode'] != "GUIDED":
+             backend.set_mode("GUIDED")
              # Small blocking wait to ensure mode switch is processed by FC
              import time
              time.sleep(0.5)
         
         # 2. Send Takeoff Command
-        self.backend.takeoff(altitude=alt)
+        backend.takeoff(altitude=alt)
 
              
+    def arm_all_drones(self):
+        """Arms ALL connected drones simultaneously."""
+        print("[SWARM] 🛡️ Arming ALL connected drones...")
+        armed_count = 0
+        for idx, backend in self.backends.items():
+            if backend.connected:
+                print(f"  [{backend.log_prefix}] Sending ARM command...")
+                backend.arm_disarm(True)
+                armed_count += 1
+        print(f"[SWARM] ARM command sent to {armed_count} drones.")
+
     def start_mission(self):
+        """Starts guided mission on ALL connected drones simultaneously (Swarm Mode)."""
         try:
-            alt = float(self.entry_alt.get())
+            alt = float(self.detail_alt_entry.get())
         except ValueError:
             alt = 10.0
             
-        print(f"[{self.backend.log_prefix}] Starting Guided Mission with Alt: {alt}")
+        print(f"[SWARM] 🚁 Starting Guided Mission on ALL drones at {alt}m...")
         
-        # AUTO-ENABLE AI PILOT
-        if not self.var_ai_enable.get():
-            self.var_ai_enable.set(True)
-            self.toggle_ai()
-            print(f"[{self.backend.log_prefix}] [GUI] Auto-Enabled AI Pilot for Mission.")
-            
-        # EXECUTE GUIDED MISSION (Python Driven)
-        self.mission_mgr.execute_guided_mission(altitude=alt)
+        started_count = 0
+        for idx, backend in self.backends.items():
+            if backend.connected:
+                mgr = self.mission_mgrs.get(idx)
+                if mgr and mgr.waypoints:
+                    print(f"  [{backend.log_prefix}] Launching guided mission with {len(mgr.waypoints)} waypoints...")
+                    mgr.execute_guided_mission(altitude=alt)
+                    started_count += 1
+                else:
+                    print(f"  [{backend.log_prefix}] Skipped (no waypoints loaded).")
+            else:
+                print(f"  [D{idx-1}] Skipped (not connected).")
+        
+        print(f"[SWARM] Guided missions started on {started_count} drones.")
         
     def pause_mission_panel(self):
         self.mission_mgr.pause_mission()

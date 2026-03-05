@@ -97,6 +97,7 @@ class DroneBackend:
                 self.master.wait_heartbeat(timeout=3)
                 print(f"{self.log_prefix} Heartbeat received from System {self.master.target_system}")
                 self.connected = True
+                self.last_attitude_time = time.time() # Prevent immediate stall loop
                 
                 # Request Data Streams (Modern)
                 self._request_message_interval(mavutil.mavlink.MAVLINK_MSG_ID_GPS_RAW_INT, 1) # 1Hz
@@ -233,6 +234,13 @@ class DroneBackend:
                 # Capture Sensor Health Bitmap
                 self.state['sensor_health'] = msg.onboard_control_sensors_health
 
+                # Use health bitmap to clear PreArm status robustly
+                if hasattr(mavutil.mavlink, 'MAV_SYS_STATUS_PREARM_CHECK'):
+                    if (msg.onboard_control_sensors_health & mavutil.mavlink.MAV_SYS_STATUS_PREARM_CHECK):
+                        self.state['ready_to_arm'] = True
+                        if "PreArm:" in self.state.get('error', ''):
+                            self.state['error'] = ""
+
             elif type_ == 'ATTITUDE':
                 self.state['roll'] = msg.roll
                 self.state['pitch'] = msg.pitch
@@ -271,12 +279,12 @@ class DroneBackend:
                 if "PreArm:" in text:
                     self.state['ready_to_arm'] = False
                     self.state['error'] = text # Store specifically as error
-                elif "Ready to fly" in text:
+                elif "Ready to fly" in text or "READY TO ARM" in text.upper():
                     self.state['ready_to_arm'] = True
                     self.state['error'] = "" # Clear error
                 elif "ARMED" in text:
-                     # Sometimes text confirms arming
-                     pass
+                     self.state['ready_to_arm'] = True
+                     self.state['error'] = ""
                 
             elif type_ == 'EKF_STATUS_REPORT':
                 self.state['ekf_velocity_var'] = msg.velocity_variance
@@ -350,22 +358,14 @@ class DroneBackend:
     def takeoff(self, altitude=TAKEOFF_ALT_DEFAULT):
         if not self.master: return
         print(f"{self.log_prefix} Taking off to {altitude}m (Relative)")
-        
-        current_lat = int(self.state['lat'] * 1e7)
-        current_lon = int(self.state['lon'] * 1e7)
-        
-        # Use COMMAND_INT for explicit frame support
-        self.master.mav.command_int_send(
+        # TAKEOFF requires GUIDED mode.
+        # Sending 0 for Lat/Lon uses current position.
+        self.master.mav.command_long_send(
             self.master.target_system, self.master.target_component,
-            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT, # Frame: Relative to Home
-            mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-            0, 0, # current, autocontinue
-            0, 0, 0, 0, # params 1-4
-            current_lat, # x (Lat)
-            current_lon, # y (Lon)
-            altitude     # z (Alt)
+            mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0,
+            0, 0, 0, 0, 
+            0, 0, altitude
         )
-        
     def send_velocity(self, vx, vy, vz=0):
         if not self.master: return
         # GUIDED Velocity Control (BODY FRAME causes drift when stopping!)

@@ -112,6 +112,8 @@ class MissionManager:
             mavutil.mavlink.MAV_MISSION_TYPE_MISSION
         )
         
+        return True
+        
     # --- GUIDED MODE EXECUTION ---
     
     def execute_guided_mission(self, altitude=5.0):
@@ -164,14 +166,17 @@ class MissionManager:
                  return
 
             # 2. Arm & Takeoff Logic
-            # (Removed dangerous set_home call)
-            
             current_alt = self.backend.state['alt_rel']
             is_flying = current_alt > 2.0 and self.backend.state['armed']
             
             if is_flying:
                 print(f"[Mission] ✈️ Already flying at {current_alt:.1f}m. Skipping Takeoff.")
             else:
+                # Set Home to Current Position before Arming
+                print(f"[Mission] 🏠 Setting Home to launch position...")
+                self.backend.set_home(set_current=True)
+                time.sleep(0.5)
+                
                 # Need to ARM and TAKEOFF
                 if not self.backend.state['armed']:
                     print("[Mission] 🛡️ Arming...")
@@ -273,6 +278,13 @@ class MissionManager:
                     for _ in range(5):
                         if self.paused or self.resumed_flag: break
                         time.sleep(0.1)
+                # Wait for Arrival loop ends here
+        
+            # 4. Mission End Behavior - LAND at current position
+            if not self.paused:
+                 print(f"{self.backend.log_prefix} [Mission] 🏁 Mission Complete. Auto-LAND.")
+                 self.backend.set_mode("LAND")
+
         except Exception as e:
             import traceback
             print(f"[Mission] 💥 THREAD CRASH: {e}")
@@ -287,8 +299,6 @@ class MissionManager:
              time.sleep(0.05)
         self.paused = True
 
-
-        
     def resume_mission(self):
         print(f"{self.backend.log_prefix} [Mission] ▶️ RESUMING Mission (Switching to GUIDED)")
         self.backend.set_mode("GUIDED")
@@ -297,23 +307,7 @@ class MissionManager:
 
     def drop_payload(self):
         print(f"{self.backend.log_prefix} [Mission] 📦 Triggering Sequential Drop (Output 5-8)...")
-        self.backend.drop_payload() 
-
-
-
-
-                
-        # 4. Mission End Behavior
-        # Drone 1 (ID 2): Auto-RTL
-        # Drone 0 (ID 1): Hover (for Drop Workflow)
-        
-        if self.backend.drone_id == 2:
-             print(f"{self.backend.log_prefix} [Mission] 🏁 Mission Complete. Auto-RTL (Drone 1).")
-             self.backend.set_mode("RTL")
-        else:
-             print(f"{self.backend.log_prefix} [Mission] 🏁 Mission Complete. Hovering at final waypoint.")
-
-
+        self.backend.drop_payload()
 
     def _send_goto(self, lat, lon, alt):
         # MAV_CMD_DO_REPOSITION or SET_POSITION_TARGET_GLOBAL_INT
