@@ -1,0 +1,3 @@
+/home/prince/nanodet/nanodet_frisbee_rpi4/build/CMakeFiles/nanodet_demo.dir
+/home/prince/nanodet/nanodet_frisbee_rpi4/build/CMakeFiles/edit_cache.dir
+/home/prince/nanodet/nanodet_frisbee_rpi4/build/CMakeFiles/rebuild_cache.dir

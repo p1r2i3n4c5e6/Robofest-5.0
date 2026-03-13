@@ -62,8 +62,11 @@ class DroneBackend:
         
         # Payload State
         self.drop_index = 0 # 0 to 8
-        self.lock = threading.Lock()
+        self.lock = threading.RLock() # Use Re-entrant Lock to avoid deadlocks in callbacks
         self.thread = None
+        
+        # AI Detection Callback (set by GUI)
+        self.on_ai_detection = None
 
 
     def get_state(self):
@@ -93,19 +96,43 @@ class DroneBackend:
         while self.running and not self.connected:
             try:
                 print(f"{self.log_prefix} Connecting to {self.connect_str}...")
-                self.master = mavutil.mavlink_connection(self.connect_str, baud=self.baud_rate)
-                self.master.wait_heartbeat(timeout=3)
-                print(f"{self.log_prefix} Heartbeat received from System {self.master.target_system}")
-                self.connected = True
-                self.last_attitude_time = time.time() # Prevent immediate stall loop
+                self.master = mavutil.mavlink_connection(self.connect_str, baud=self.baud_rate, source_system=255)
+                # Wait for FIRST heartbeat to identify the drone
+                print(f"{self.log_prefix} Waiting for Drone Heartbeat (Ignoring Companion/GCS)...")
                 
-                # Request Data Streams (Modern)
+                start_wait = time.time()
+                while time.time() - start_wait < 10.0:
+                    msg = self.master.recv_match(type='HEARTBEAT', blocking=True, timeout=2)
+                    if msg:
+                        # Ignore common non-drone types (GCS, Onboard Controller, Antenna Trackers)
+                        if msg.type not in [
+                            mavutil.mavlink.MAV_TYPE_GCS, 
+                            mavutil.mavlink.MAV_TYPE_ONBOARD_CONTROLLER,
+                            mavutil.mavlink.MAV_TYPE_ANTENNA_TRACKER
+                        ]:
+                            self.master.target_system = msg.get_srcSystem()
+                            self.master.target_component = msg.get_srcComponent()
+                            print(f"{self.log_prefix} ✅ Locked onto Drone: Sys {self.master.target_system} Comp {self.master.target_component} (Type {msg.type})")
+                            break
+                        else:
+                            print(f"{self.log_prefix}   - Skipping Heartbeat from Sys {msg.get_srcSystem()} (Type {msg.type})")
+                
+                if not self.master.target_system:
+                    print(f"{self.log_prefix} ❌ Error: No drone heartbeat found. Is it on?")
+                    self.master.close()
+                    time.sleep(2)
+                    continue
+
+                self.connected = True
+                self.last_attitude_time = time.time() 
+                
+                # Request Data Streams (Modern) - Reduced rates for SiK radio stability
                 self._request_message_interval(mavutil.mavlink.MAVLINK_MSG_ID_GPS_RAW_INT, 1) # 1Hz
-                self._request_message_interval(mavutil.mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT, 2) # 2Hz
+                self._request_message_interval(mavutil.mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT, 1) # 1Hz
                 self._request_message_interval(mavutil.mavlink.MAVLINK_MSG_ID_SYS_STATUS, 1) # 1Hz
-                self._request_message_interval(mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE, 10) # 10Hz (Fast for smooth AHRS)
+                self._request_message_interval(mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE, 4) # 4Hz (Safe for 57600 baud)
                 self._request_message_interval(mavutil.mavlink.MAVLINK_MSG_ID_HEARTBEAT, 1) # 1Hz
-                self._request_message_interval(mavutil.mavlink.MAVLINK_MSG_ID_EKF_STATUS_REPORT, 2) # 2Hz EKF
+                self._request_message_interval(mavutil.mavlink.MAVLINK_MSG_ID_EKF_STATUS_REPORT, 1) # 1Hz
                 
                 # Request Data Streams (Legacy Fallback) - IMPORTANT for older SITL/Firmware
                 try:
@@ -126,12 +153,15 @@ class DroneBackend:
                 continue
                 
             try:
-                # Send Heartbeat (GCS)
-                self.master.mav.heartbeat_send(
-                    mavutil.mavlink.MAV_TYPE_GCS,
-                    mavutil.mavlink.MAV_AUTOPILOT_INVALID,
-                    0, 0, 0
-                )
+                # Send Heartbeat (GCS) - Slowed to 1Hz for radio stability
+                current_time = time.time()
+                if not hasattr(self, 'last_gcs_heartbeat') or current_time - self.last_gcs_heartbeat > 1.0:
+                    self.master.mav.heartbeat_send(
+                        mavutil.mavlink.MAV_TYPE_GCS,
+                        mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+                        0, 0, 0
+                    )
+                    self.last_gcs_heartbeat = current_time
 
                 # Poll Pre-Arm Checks (Every 2 seconds approx)
                 current_time = time.time()
@@ -148,27 +178,54 @@ class DroneBackend:
                     
                 time.sleep(0.1) # 10Hz Loop
                 
-                # AGGRESSIVE DATA STREAM CHECK
-                # If we haven't received Attitude for >2s, re-request EVERYTHING
-                # This fixes the "Nothing Updating" issue on some flight controllers
-                if time.time() - self.last_attitude_time > 2.0:
-                     print(f"{self.log_prefix} Data Stalled. Re-requesting Streams...")
-                     try:
-                        self.master.mav.request_data_stream_send(
-                            self.master.target_system, self.master.target_component,
-                            mavutil.mavlink.MAV_DATA_STREAM_ALL, 4, 1
-                        )
-                        # Also extra heartbeats
-                        self._request_message_interval(mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE, 10)
-                     except: pass
-                     self.last_attitude_time = time.time() # Reset to avoid spamming too fast
+                # AGGRESSIVE DATA STREAM CHECK (Improved for Multi-Node Stability)
+                # If we haven't received ANY message from the drone for 15s, re-request.
+                # (Increased to 15s to be EXTREMELY safe for slow radio links)
+                if current_time - self.last_attitude_time > 15.0:
+                     if not hasattr(self, 'last_stall_retry') or current_time - self.last_stall_retry > 45.0:
+                         print(f"{self.log_prefix} ⚠️ Data Stalled (>15s). Refreshing Streams...")
+                         try:
+                            self.master.mav.request_data_stream_send(
+                                self.master.target_system, self.master.target_component,
+                                mavutil.mavlink.MAV_DATA_STREAM_ALL, 2, 1 
+                            )
+                            self._request_message_interval(mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE, 4)
+                            self.last_stall_retry = current_time
+                         except: pass
 
                 
             except Exception as e:
                 print(f"{self.log_prefix} Loop error: {e}")
                 
     def _process_message(self, msg):
+        """Processes a single MAVLink message and updates state."""
         type_ = msg.get_type()
+        src_sys = msg.get_srcSystem()
+        src_comp = msg.get_srcComponent()
+        
+        # 🛡️ FIX: Initialize context at the very top to avoid "referenced before assignment" error
+        ai_detect_context = None 
+
+        # FILTER: Only process vehicle data from the drone (System ID 1)
+        # 🛡️ EXCEPTION: Always allow AI detections from companion (ID 100) and ArduPilot status (ID 1)
+        is_ai_msg = (type_ == 'STATUSTEXT' and hasattr(msg, 'text') and "AI_DETECT" in str(msg.text))
+        
+        if not is_ai_msg and type_ != 'STATUSTEXT' and src_sys != self.master.target_system:
+             if not hasattr(self, '_ign_count'): self._ign_count = 0
+             self._ign_count += 1
+             if self._ign_count % 100 == 0: # Only log every 100 to avoid UDP spam
+                 print(f"{self.log_prefix} Ignored msg from Sys {src_sys} Comp {src_comp} Type {type_}")
+             return
+
+        # Explicit Debug for UDP routing issues
+        if is_ai_msg:
+             print(f"{self.log_prefix} 📢 MAVLink AI Packet Received from Sys {src_sys}")
+
+        # 🛡️ STABILITY FIX: Reset stall timer on ANY valid message from System 1 (the Drone)
+        # This prevents false stalls if only one type of data (e.g. Attitude) is dropping
+        if src_sys == self.master.target_system:
+            self.last_attitude_time = time.time()
+
         with self.lock:
             if type_ == 'HEARTBEAT':
                 # Only process hearbeats from the target vehicle (usually system 1)
@@ -176,22 +233,11 @@ class DroneBackend:
                 old_mode = self.state['mode']
                 
                 # Log mode changes
-                if new_mode != old_mode and old_mode != 'UNKNOWN':
-                    print(f"{self.log_prefix} 🔄 Mode: {new_mode}")
-                
-                self.state['mode'] = new_mode
-                self.state['raw_mode_base'] = msg.base_mode
-                self.state['raw_mode_custom'] = msg.custom_mode
-                
-                new_armed = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
-                if new_armed != self.state['armed']:
-                    if new_armed:
-                        print(f"{self.log_prefix} 🔴 ARMED")
-                    else:
-                        print(f"{self.log_prefix} 🟢 DISARMED")
-                self.state['armed'] = new_armed
-                self.state['system_status'] = msg.system_status
-                
+                self.state['mode'] = mavutil.mode_string_v10(msg)
+                self.state['armed'] = (msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED) != 0
+                self.state['last_heartbeat'] = time.time()
+                self.state['connected'] = True
+
             elif type_ == 'GPS_RAW_INT':
                 self.state['gps_fix'] = msg.fix_type
                 self.state['gps_sats'] = msg.satellites_visible
@@ -200,29 +246,17 @@ class DroneBackend:
                 # Fix String
                 fixes = {0: "No Fix", 1: "No Fix", 2: "2D Fix", 3: "3D Fix", 4: "DGPS", 5: "RTK"}
                 self.state['gps_string'] = fixes.get(msg.fix_type, f"Type {msg.fix_type}")
-                
+
             elif type_ == 'GLOBAL_POSITION_INT':
-                self.state['alt_rel'] = msg.relative_alt / 1000.0 # mm to m
-                self.state['heading'] = msg.hdg / 100.0
                 curr_lat = msg.lat / 1e7
                 curr_lon = msg.lon / 1e7
                 self.state['lat'] = curr_lat
                 self.state['lon'] = curr_lon
+                self.state['alt_abs'] = msg.alt / 1000.0
+                self.state['alt_rel'] = msg.relative_alt / 1000.0
+                self.state['heading'] = msg.hdg / 100.0
+                self.state['gps_fix'] = 3 # Assume fix if GPS_INT received
                 
-                # Velocity & Climb
-                vx = msg.vx / 100.0
-                vy = msg.vy / 100.0
-                vz = msg.vz / 100.0
-                self.state['speed'] = (vx**2 + vy**2)**0.5
-                self.state['climb'] = -vz # NED convention, z down is positive
-                
-                # Set Home if first 3D fix
-                if self.state['gps_fix'] >= 3 and self.state['home_lat'] is None:
-                    self.state['home_lat'] = curr_lat
-                    self.state['home_lon'] = curr_lon
-                    print(f"{self.log_prefix} Home Set: {curr_lat}, {curr_lon}")
-                    
-                # Calculate Dist
                 if self.state['home_lat']:
                     self.state['dist_home'] = haversine(
                         self.state['home_lat'], self.state['home_lon'],
@@ -231,10 +265,7 @@ class DroneBackend:
                 
             elif type_ == 'SYS_STATUS':
                 self.state['voltage'] = msg.voltage_battery / 1000.0
-                # Capture Sensor Health Bitmap
                 self.state['sensor_health'] = msg.onboard_control_sensors_health
-
-                # Use health bitmap to clear PreArm status robustly
                 if hasattr(mavutil.mavlink, 'MAV_SYS_STATUS_PREARM_CHECK'):
                     if (msg.onboard_control_sensors_health & mavutil.mavlink.MAV_SYS_STATUS_PREARM_CHECK):
                         self.state['ready_to_arm'] = True
@@ -245,53 +276,40 @@ class DroneBackend:
                 self.state['roll'] = msg.roll
                 self.state['pitch'] = msg.pitch
                 self.state['yaw'] = msg.yaw
-                self.last_attitude_time = time.time() # Mark alive
-
 
             elif type_ == 'STATUSTEXT':
-                # msg.text is bytes in newer pymavlink, sometimes string
                 text = msg.text
                 if hasattr(text, 'decode'):
                     text = text.decode('utf-8', errors='ignore')
                 
-                # Add emoji based on message type
-                if "PreArm:" in text:
-                    emoji = "⚠️"
-                elif "Ready to fly" in text or "Arm" in text:
-                    emoji = "✅"
-                elif "Error" in text.lower() or "Fail" in text.lower():
-                    emoji = "❌"
-                elif "GPS" in text:
-                    emoji = "🛰️"
-                elif "Calibrat" in text:
-                    emoji = "🔧"
-                elif "Mode" in text or "mode" in text:
-                    emoji = "🔄"
-                else:
-                    emoji = "📡"
-                
-                print(f"{self.log_prefix} {emoji} {text}")
-                self.state['status_text'] = text
-                
-                # Simple Logic to detect Ready/Not Ready from ArduPilot Text
-                # ArduPilot sends "PreArm: [Reason]" when checks fail
-                # ArduPilot sends "Ready to fly" when checks pass
+                # ArduPilot Status Logic
                 if "PreArm:" in text:
                     self.state['ready_to_arm'] = False
-                    self.state['error'] = text # Store specifically as error
+                    self.state['error'] = text
                 elif "Ready to fly" in text or "READY TO ARM" in text.upper():
                     self.state['ready_to_arm'] = True
-                    self.state['error'] = "" # Clear error
+                    self.state['error'] = ""
                 elif "ARMED" in text:
                      self.state['ready_to_arm'] = True
                      self.state['error'] = ""
+
+                # Store for UI display
+                self.state['status_text'] = text
                 
-            elif type_ == 'EKF_STATUS_REPORT':
-                self.state['ekf_velocity_var'] = msg.velocity_variance
-                self.state['ekf_pos_horiz_var'] = msg.pos_horiz_variance
-                self.state['ekf_pos_vert_var'] = msg.pos_vert_variance
-                self.state['ekf_compass_var'] = msg.compass_variance
-                self.state['ekf_flags'] = msg.flags
+                # Capture AI Payload for external callback
+                if text.startswith("AI_DETECT:"):
+                    # Format from Pi: AI_DETECT:id,cx,cy,fw,fh,x,y,z
+                    parts = text.split(":")[1].split(",")
+                    if len(parts) >= 8:
+                        obj_id = int(parts[0])
+                        cx, cy = int(parts[1]), int(parts[2])
+                        fw, fh = int(parts[3]), int(parts[4])
+                        x_dist, y_dist, z_alt = map(float, parts[5:8])
+                        
+                        print(f"{self.log_prefix} 🎯 ID {obj_id} DETECT via MAVLink: X={x_dist:.2f}m, Y={y_dist:.2f}m")
+                        if self.on_ai_detection:
+                            # Signature: (drone_id, obj_id, cx, cy, fw, fh, x_dist, y_dist, z_alt)
+                            self.on_ai_detection(self.drone_id, obj_id, cx, cy, fw, fh, x_dist, y_dist, z_alt)
                 
     def _request_message_interval(self, message_id, frequency_hz):
         if not self.master: return
@@ -444,11 +462,11 @@ class DroneBackend:
         self.target_altitude = alt_m
     
     def set_speed(self, speed_ms):
-        """Set ground speed using MAV_CMD_DO_CHANGE_SPEED"""
+        """Set ground speed using MAV_CMD_DO_CHANGE_SPEED and WPNAV_SPEED"""
         if not self.master: return
         print(f"{self.log_prefix} Setting speed to {speed_ms} m/s")
         
-        # MAV_CMD_DO_CHANGE_SPEED
+        # 1. MAV_CMD_DO_CHANGE_SPEED
         # param1: Speed type (0=Airspeed, 1=Ground Speed)
         # param2: Speed (m/s)
         # param3: Throttle (-1=no change)
@@ -459,6 +477,16 @@ class DroneBackend:
             speed_ms,  # Speed in m/s
             -1,  # Throttle (no change)
             0, 0, 0, 0
+        )
+        
+        # 2. Also set WPNAV_SPEED parameter directly (often required for GUIDED mode)
+        # Note: WPNAV_SPEED is in cm/s, so we multiply by 100
+        speed_cms = int(speed_ms * 100)
+        self.master.mav.param_set_send(
+            self.master.target_system, self.master.target_component,
+            b'WPNAV_SPEED',
+            speed_cms,
+            mavutil.mavlink.MAV_PARAM_TYPE_REAL32
         )
         
         # Store for reference

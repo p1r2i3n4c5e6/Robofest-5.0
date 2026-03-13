@@ -9,6 +9,7 @@ import threading
 import queue
 import datetime
 import sys
+import socket
 
 # Monkey-patch PIL.ImageTk to avoid __del__ errors
 try:
@@ -36,6 +37,16 @@ BTN_WARN = "#FF6600"       # Safety Orange
 NUM_DRONES = 4             # Configurable Swarm Size
 
 import math
+
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371000 # meters
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2) * math.sin(dlambda/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    return R * c
 
 class AHRSWidget(tk.Canvas):
     def __init__(self, master, width=300, height=200):
@@ -246,6 +257,7 @@ class EKFBarWidget(tk.Canvas):
 from ai_pilot import AIPilot
 from backend import DroneBackend
 from mission import MissionManager
+from geotagger import GeoTagger
 
 class DroneApp(tk.Tk):
     def __init__(self):
@@ -262,6 +274,7 @@ class DroneApp(tk.Tk):
         
         self.active_drone_idx = 1 # Will be set by add_new_drone
         self.edit_mode_index = None 
+        self.geotagged_ids = set() # Track unique frisbee IDs seen in this session
         
         # Styles
         self.setup_styles() # Move styles up so we can use them in add_new_drone if needed
@@ -297,6 +310,12 @@ class DroneApp(tk.Tk):
             print("Loaded drone_icon.png")
         except: pass
 
+        self.tab_frame = None
+        self.log_widgets = {} # Managed by add_new_drone
+        
+        # Throttling Map Updates to prevent Segmentation Faults
+        self.last_marker_pos = {} # idx -> (lat, lon)
+        self.last_marker_time = {} # idx -> time
         self.marker_home = None
         self.marker_gcs = None 
         self.centered_map = False
@@ -312,11 +331,79 @@ class DroneApp(tk.Tk):
         self.create_main_view()
         self.create_log_view()
 
+        # Initialize GeoTagger (Best Data from nanodet_int8/build/calibration.yml)
+        # H_FOV = 2 * atan(640 / (2 * 950.83)) = 37.2 deg
+        # V_FOV = 2 * atan(480 / (2 * 950.83)) = 28.3 deg
+        self.geotagger = GeoTagger(camera_fov_h_deg=37.2, camera_fov_v_deg=28.3, pitch_offset_deg=-90.0)
+
         # NOW Add Initial Drone
         self.add_new_drone() # Adds Drone 0 (ID 1)
         
         self.startup_complete = True # Enable events
         self.update_loop()
+
+    def handle_ai_detection(self, drone_id, obj_id, cx, cy, fw, fh, x_dist, y_dist, z_alt):
+        """
+        Called by DroneBackend when an AI_DETECT STATUSTEXT is received.
+        Uses Pi-calculated relative pose (x_dist, y_dist) for projection.
+        """
+        if not hasattr(self, 'var_ai_enable') or not self.var_ai_enable.get():
+            return
+
+        if drone_id not in self.backends:
+            return
+            
+        # Prevent duplicate markers for the same ID
+        global_obj_id = f"D{drone_id}_OBJ{obj_id}"
+        if global_obj_id in self.geotagged_ids:
+            return
+
+        s = self.backends[drone_id].get_state()
+        lat, lon = s['lat'], s['lon']
+        heading = s['heading']
+        
+        # 🎯 GEOTAG LOGGING
+        log_msg = f"[{time.strftime('%H:%M:%S')}] 🎯 ID {obj_id} DETECT: {cx},{cy}\n"
+        
+        if lat and lon:
+            # Simple Bearing/Distance projection using Pi's X/Y
+            # Calculate distance and bearing relative to drone
+            dist = math.sqrt(x_dist**2 + y_dist**2)
+            bearing_offset = math.degrees(math.atan2(x_dist, y_dist))
+            true_bearing = (heading + bearing_offset) % 360
+            
+            # Use Haversine from geotagger logic to find target GPS
+            R_EARTH = 6378137.0
+            angular_dist = dist / R_EARTH
+            start_lat_rad = math.radians(lat)
+            start_lon_rad = math.radians(lon)
+            true_bearing_rad = math.radians(true_bearing)
+            
+            target_lat_rad = math.asin(math.sin(start_lat_rad) * math.cos(angular_dist) +
+                                       math.cos(start_lat_rad) * math.sin(angular_dist) * math.cos(true_bearing_rad))
+            target_lon_rad = start_lon_rad + math.atan2(math.sin(true_bearing_rad) * math.sin(angular_dist) * math.cos(start_lat_rad),
+                                                        math.cos(angular_dist) - math.sin(start_lat_rad) * math.sin(target_lat_rad))
+            
+            target_lat = math.degrees(target_lat_rad)
+            target_lon = math.degrees(target_lon_rad)
+            
+            log_msg += f"  > ✅ GEOTAG: {target_lat:.6f}, {target_lon:.6f} (Alt:{z_alt:.1f}m)\n"
+            self.geotagged_ids.add(global_obj_id)
+            self.add_geotag_marker(target_lat, target_lon, obj_id)
+        else:
+            log_msg += f"  > ⚠️ No GPS Lock\n"
+            
+        self.append_geotag_log(log_msg)
+
+    def append_geotag_log(self, text):
+        def _append():
+            if hasattr(self, 'txt_geotag_log'):
+                self.txt_geotag_log.config(state="normal")
+                self.txt_geotag_log.insert("end", text)
+                self.txt_geotag_log.see("end")
+                self.txt_geotag_log.config(state="disabled")
+        self.after(0, _append)
+
 
     def add_new_drone(self):
         idx = len(self.backends) + 1
@@ -331,6 +418,7 @@ class DroneApp(tk.Tk):
             default_conn = f'/dev/ttyUSB{idx-1}'
         
         self.backends[idx] = DroneBackend(drone_id=idx, connect_str=default_conn)
+        self.backends[idx].on_ai_detection = self.handle_ai_detection  # Wire AI detection callback
         self.mission_mgrs[idx] = MissionManager(self.backends[idx])
         self.ai_pilots[idx] = AIPilot(self.backends[idx], self.mission_mgrs[idx], self.update_video_feed, self.add_geotag_marker)
         
@@ -933,7 +1021,10 @@ class DroneApp(tk.Tk):
              print(f"Update GUI Error: {e}")
              return
         
-        # Connection
+        # Status & Connection
+        mode = s['mode']
+        armed = s['armed']
+        
         try:
             if backend.connected:
                 self.detail_conn_btn.config(text="DISCONNECT", state="normal", style="Connect.TButton")
@@ -941,21 +1032,16 @@ class DroneApp(tk.Tk):
             else:
                 self.detail_conn_btn.config(text="CONNECT", state="normal")
                 self.detail_conn_entry.config(state="normal")
+                
+            # Mode & Arming
+            state_all = "normal" if backend.connected else "disabled"
+            self.detail_btn_arm.config(state=state_all)
+            self.detail_btn_disarm.config(state=state_all)
+            self.detail_btn_takeoff.config(state=state_all)
+            self.detail_btn_land.config(state=state_all)
+            self.detail_btn_rtl.config(state=state_all)
         except Exception:
-            pass  # Prevent segfault from tkintermapview thread race
-            
-        # Status
-        mode = s['mode']
-        armed = s['armed']
-        
-        # Enable/Disable Buttons based on connection
-        state_all = "normal" if backend.connected else "disabled"
-        
-        self.detail_btn_arm.config(state=state_all)
-        self.detail_btn_disarm.config(state=state_all)
-        self.detail_btn_takeoff.config(state=state_all)
-        self.detail_btn_land.config(state=state_all)
-        self.detail_btn_rtl.config(state=state_all)
+            pass # Ignore race conditions in rapid UI updates
         # self.detail_mode_combo.config(state="readonly" if backend.connected else "disabled") 
         # Tkinter combo disable is tricky, stick to readonly or disabled
         
@@ -1132,11 +1218,13 @@ class DroneApp(tk.Tk):
         video_outer.grid(row=0, column=1, sticky="nsew")
         
         # Video Header
-        tk.Label(video_outer, text="LIVE SENSOR FEED", bg="#222f3e", fg="red", font=("Consolas", 8)).pack(fill="x")
+        tk.Label(video_outer, text="SYSTEM GEOTAG LOG", bg="#222f3e", fg="#00FF00", font=("Consolas", 8, "bold")).pack(fill="x")
         
-        # Video Feed
-        self.lbl_video = ttk.Label(video_outer, text="[NO SIGNAL]", anchor="center", background="black", foreground="white")
-        self.lbl_video.pack(side="top", padx=2, pady=2)
+        # System Log Text Widget (Replaces Video Feed)
+        self.txt_geotag_log = tk.Text(video_outer, height=15, width=40, bg="black", fg="#00FF00", font=("Consolas", 9))
+        self.txt_geotag_log.pack(side="top", fill="both", expand=True, padx=2, pady=2)
+        self.txt_geotag_log.insert("end", "[SYSTEM] Geotag Log Initialized...\n")
+        self.txt_geotag_log.config(state="disabled")
         
         # AI Control Switch (Below Video) and overlaying it? 
         self.var_ai_enable = tk.BooleanVar(value=False)
@@ -1715,29 +1803,44 @@ class DroneApp(tk.Tk):
     # --- AI PILOT INTEGRATION ---
     def toggle_ai(self):
         enabled = self.var_ai_enable.get()
-        self.ai_pilot.enabled = enabled
+        # self.ai_pilot.enabled = enabled # Legacy local AI
         if enabled:
-            if not self.ai_pilot.running:
-                self.ai_pilot.start()
-            print("[GUI] Swarm AI ENABLED")
+            print("[GUI] Swarm AI Tracking (MAVLink-Only) ENABLED")
+            self.append_geotag_log("[SYSTEM] Waiting for RPi MAVLink Detections...\n")
         else:
-            print("[GUI] Swarm AI DISABLED")
+            print("[GUI] Swarm AI Tracking DISABLED")
 
     def update_video_feed(self, frame_rgb):
-        try:
-            img = Image.fromarray(frame_rgb)
-            imgtk = ImageTk.PhotoImage(image=img)
-            self.lbl_video.configure(image=imgtk)
-            self.lbl_video.image = imgtk 
-        except Exception as e:
-            pass 
+        pass # Replaced with system logs
             
-    def add_geotag_marker(self, lat, lon):
-        self.after(0, lambda: self._add_geotag_marker_main(lat, lon))
+    def add_geotag_marker(self, lat, lon, obj_id):
+        self.after(0, lambda: self._add_geotag_marker_main(lat, lon, obj_id))
         
-    def _add_geotag_marker_main(self, lat, lon):
-        print(f"[GUI] Marking Human at {lat}, {lon}")
-        self.map_view.set_marker(lat, lon, text="HUMAN", marker_color_circle="red", marker_color_outside="yellow")
+    def _add_geotag_marker_main(self, lat, lon, obj_id):
+        print(f"[GUI] Marking Target ALERT ZONE at {lat}, {lon} (ID: {obj_id})")
+        
+        # 1. Plot target center marker
+        self.map_view.set_marker(lat, lon, text=f"🎯 FRISBEE {obj_id}", marker_color_circle="red", marker_color_outside="yellow")
+        
+        # 2. Draw "Red Alert Zone" (1.0 meter radius)
+        circle_points = []
+        R_EARTH = 6378137.0
+        radius_m = 1.0 # Adjusted to exactly 1.0m as requested
+        
+        lat_rad = math.radians(lat)
+        lon_rad = math.radians(lon)
+        angular_dist = radius_m / R_EARTH
+        
+        for i in range(18): # 18 points is enough for a smooth look
+            bearing_rad = math.radians(i * 20)
+            p_lat_rad = math.asin(math.sin(lat_rad) * math.cos(angular_dist) +
+                                  math.cos(lat_rad) * math.sin(angular_dist) * math.cos(bearing_rad))
+            p_lon_rad = lon_rad + math.atan2(math.sin(bearing_rad) * math.sin(angular_dist) * math.cos(lat_rad),
+                                             math.cos(angular_dist) - math.sin(lat_rad) * math.sin(p_lat_rad))
+            circle_points.append((math.degrees(p_lat_rad), math.degrees(p_lon_rad)))
+            
+        # Draw as a "Red Zone"
+        self.map_view.set_polygon(circle_points, outline_color="#FF0000", fill_color="#FF4444", border_width=2)
 
     def toggle_fullscreen(self, event=None):
         self.fullscreen_state = not self.fullscreen_state
@@ -1789,28 +1892,41 @@ class DroneApp(tk.Tk):
             except: pass
             
             if s['lat'] != 0 and s['lon'] != 0:
-                try:
-                    # Update/Create Marker
-                    marker = self.markers_drone.get(idx)
-                    if marker is None:
-                        label = f"{idx-1}"
-                        # Use Icon if available
-                        if self.drone_icon_img:
-                             marker = self.map_view.set_marker(s['lat'], s['lon'], text=label, icon=self.drone_icon_img)
+                # 🛡️ STABILITY FIX: Throttled Map Updates
+                # Only update marker if it moved significantly (>1m) or 0.5s passed
+                prev_pos = self.last_marker_pos.get(idx, (0, 0))
+                prev_time = self.last_marker_time.get(idx, 0)
+                curr_time = time.time()
+                
+                # Haversine or simple approx for 1m threshold
+                dist = haversine(s['lat'], s['lon'], prev_pos[0], prev_pos[1])
+                
+                if dist > 1.0 or (curr_time - prev_time) > 0.5:
+                    try:
+                        # Update/Create Marker
+                        marker = self.markers_drone.get(idx)
+                        if marker is None:
+                            label = f"{idx-1}"
+                            # Use Icon if available
+                            if self.drone_icon_img:
+                                 marker = self.map_view.set_marker(s['lat'], s['lon'], text=label, icon=self.drone_icon_img)
+                            else:
+                                 marker = self.map_view.set_marker(s['lat'], s['lon'], text=label, marker_color_circle="red" if idx==1 else "blue") # Default to colors
+                            self.markers_drone[idx] = marker
                         else:
-                             marker = self.map_view.set_marker(s['lat'], s['lon'], text=label, marker_color_circle="red" if idx==1 else "blue") # Default to colors
-                        self.markers_drone[idx] = marker
-                    else:
-                        marker.set_position(s['lat'], s['lon'])
+                            marker.set_position(s['lat'], s['lon'])
                         
-                    # Auto-Center (Only on Active Drone)
-                    if idx == self.active_drone_idx:
-                         if not self.centered_map:
-                             self.map_view.set_position(s['lat'], s['lon'])
-                             self.map_view.set_zoom(18) 
-                             self.centered_map = True
-                except Exception as e:
-                    pass
+                        self.last_marker_pos[idx] = (s['lat'], s['lon'])
+                        self.last_marker_time[idx] = curr_time
+                            
+                        # Auto-Center (Only on Active Drone)
+                        if idx == self.active_drone_idx:
+                             if not self.centered_map:
+                                 self.map_view.set_position(s['lat'], s['lon'])
+                                 self.map_view.set_zoom(18) 
+                                 self.centered_map = True
+                    except Exception as e:
+                        pass
             
             # 1b. Update Home Launch Marker (If available)
             if s['home_lat'] and s['home_lon']:
@@ -1848,8 +1964,8 @@ class DroneApp(tk.Tk):
              self.flash_emergency(True, msg=critical_msg)
         else:
              self.flash_emergency(False)
-
-        self.after(100, self.update_loop)
+        # 3. SCHEDULE NEXT UPDATE (Reduced to 2Hz for Segfault Stability)
+        self.after(500, self.update_loop)
 
     def check_drone_selection_click(self, coords):
         # Determine if click is near a drone

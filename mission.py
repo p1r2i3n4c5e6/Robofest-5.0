@@ -137,8 +137,11 @@ class MissionManager:
             
         # Home Check
         if not self.backend.state['home_lat']:
-             print("[Mission] ❌ Home position not set. Aborting.")
-             return
+             print("[Mission] 🏠 Home position not set. Auto-setting to current launch position...")
+             self.backend.set_home(set_current=True)
+             time.sleep(1.0) # Wait for MAVLink acknowledgement
+             if not self.backend.state['home_lat']:
+                 print("[Mission] ❌ Still waiting for Home position. Proceeding anyway, but RTL may use launch point.")
 
         import threading
         t = threading.Thread(target=self._run_guided_mission, args=(altitude,), daemon=True)

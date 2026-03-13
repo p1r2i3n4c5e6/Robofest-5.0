@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Name=Robofest Drone GCS
+Comment=Launch Ground Control Station for Robofest Drone
+Exec=bash -c 'cd /home/prince/Robofest-5.0 && python3 main.py; exec bash'
+Icon=utilities-terminal
+Terminal=true
+Type=Application
+Categories=Utility;Application;

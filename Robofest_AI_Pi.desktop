@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Name=Start AI Tracking
+Comment=Launch Frisbee Detection and Geotagging
+Exec=lxterminal -e bash /home/swarm1/rpi_launcher.sh
+Icon=utilities-terminal
+Terminal=false
+Type=Application
+Categories=Utility;Application;
