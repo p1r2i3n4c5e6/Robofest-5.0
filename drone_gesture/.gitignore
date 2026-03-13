@@ -1,0 +1,25 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+venv/
+venv*/
+.venv/
+env/
+ENV/
+
+# VS Code
+.vscode/
+
+# Project Specific
+yolov8n.pt
+yolov8n_ncnn_model/
+hand_landmarker.task
+pip_log.txt
+pip_list.txt
+
+# MediaPipe / TensorFlow cache
+.mediapipe/
+.tensorflow/

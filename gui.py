@@ -10,6 +10,10 @@ import queue
 import datetime
 import sys
 import socket
+import threading
+import json
+import subprocess
+import os
 
 # Monkey-patch PIL.ImageTk to avoid __del__ errors
 try:
@@ -335,9 +339,16 @@ class DroneApp(tk.Tk):
         # H_FOV = 2 * atan(640 / (2 * 950.83)) = 37.2 deg
         # V_FOV = 2 * atan(480 / (2 * 950.83)) = 28.3 deg
         self.geotagger = GeoTagger(camera_fov_h_deg=37.2, camera_fov_v_deg=28.3, pitch_offset_deg=-90.0)
+        self.gesture_proc = None
 
         # NOW Add Initial Drone
         self.add_new_drone() # Adds Drone 0 (ID 1)
+        
+        # Start Gesture Command Listener (UDP 5006)
+        threading.Thread(target=self.listen_gesture_commands, daemon=True).start()
+        
+        # Auto-launch Gesture System
+        self.launch_gesture_system()
         
         self.startup_complete = True # Enable events
         self.update_loop()
@@ -495,6 +506,9 @@ class DroneApp(tk.Tk):
         return self.ai_pilots[self.active_drone_idx]
 
     def shutdown(self):
+        if hasattr(self, 'gesture_proc') and self.gesture_proc:
+            print("[SYSTEM] Terminating Gesture System...")
+            self.gesture_proc.terminate()
         for b in self.backends.values():
             b.stop()
 
@@ -2031,6 +2045,52 @@ class DroneApp(tk.Tk):
             
         if hasattr(self, 'osd_alt') and self.osd_alt:
             self.osd_alt.config(text=f"ALT: {s['alt_rel']:.1f}m")
+
+    def listen_gesture_commands(self):
+        """Listens for commands from the Gesture System via UDP port 5006"""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("127.0.0.1", 5006))
+        print("[SYSTEM] GCS Gesture Listener active on Port 5006")
+        
+        while True:
+            try:
+                data, addr = sock.recvfrom(1024)
+                msg = data.decode().strip().upper()
+                print(f"[GCS] Received Gesture Link: {msg}")
+                
+                # Execute button actions based on gesture
+                if msg == "ARM":
+                    print("[GCS] STICKY ARM -> Triggering ARM ALL DRONES")
+                    self.after(0, self.arm_all_drones)
+                elif msg == "SWARM":
+                    print("[GCS] STICKY SWARM -> Triggering START ALL GUIDED")
+                    self.after(0, self.start_mission)
+                elif msg == "TAKEOFF":
+                    print("[GCS] STICKY TAKEOFF -> Triggering Active Drone Takeoff")
+                    self.after(0, self.do_takeoff_active)
+                elif msg == "STOP":
+                    print("[GCS] STICKY STOP -> Halting movement")
+                    # Optionally halt all, but typically STOP in gesture is used for safety
+                    pass
+            except Exception as e:
+                print(f"[GCS] Gesture Listener Error: {e}")
+                time.sleep(1)
+
+    def launch_gesture_system(self):
+        """Launches the drone_gesture/main.py script in a separate process"""
+        try:
+            print("[SYSTEM] Auto-launching Drone Gesture System...")
+            root_dir = os.path.dirname(os.path.abspath(__file__))
+            script_path = os.path.join(root_dir, "drone_gesture", "main.py")
+            
+            if os.path.exists(script_path):
+                self.gesture_proc = subprocess.Popen([sys.executable, script_path], 
+                                                    cwd=os.path.dirname(script_path))
+                print(f"[SYSTEM] Gesture System Process started (PID: {self.gesture_proc.pid})")
+            else:
+                print(f"[SYSTEM] ❌ Error: Gesture script not found at {script_path}")
+        except Exception as e:
+            print(f"[SYSTEM] ❌ Failed to launch gesture system: {e}")
 
 
 

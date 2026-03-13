@@ -1,0 +1,8 @@
+opencv-python
+mediapipe==0.10.9
+ncnn
+numpy==1.26.4
+pymavlink
+joblib
+scipy
+ultralytics
